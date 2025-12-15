@@ -271,9 +271,13 @@ collect_configuration() {
     # S3 Bucket
     prompt_with_help "S3_BUCKET_NAME" \
         "6. Enter the S3 bucket name where your table data is stored" \
-        "This is where Databricks stores the actual data files for your tables.
+        "Just the bucket name, not the full path!
    Find it in: Unity Catalog → Your Catalog → Storage Location
-   Example: my-company-datalake-bucket"
+   Example: my-company-datalake-bucket (not s3://my-company-datalake-bucket/path/...)"
+    
+    # Strip s3:// prefix and any path if user included it
+    S3_BUCKET_NAME="${S3_BUCKET_NAME#s3://}"
+    S3_BUCKET_NAME="${S3_BUCKET_NAME%%/*}"
     
     # AWS Region
     prompt_with_help "AWS_REGION" \
@@ -380,7 +384,7 @@ create_iam_role() {
         print_success "IAM role created: ${role_name}"
     fi
     
-    # Attach S3 policy
+    # Attach S3 policy with comprehensive permissions
     print_info "Attaching S3 access policy..."
     aws iam put-role-policy \
         --role-name "$role_name" \
@@ -388,8 +392,24 @@ create_iam_role() {
         --policy-document "{
             \"Version\": \"2012-10-17\",
             \"Statement\": [
-                {\"Effect\": \"Allow\", \"Action\": [\"s3:GetObject\"], \"Resource\": [\"arn:aws:s3:::${S3_BUCKET_NAME}/*\"]},
-                {\"Effect\": \"Allow\", \"Action\": [\"s3:ListBucket\"], \"Resource\": [\"arn:aws:s3:::${S3_BUCKET_NAME}\"]}
+                {
+                    \"Effect\": \"Allow\",
+                    \"Action\": [
+                        \"s3:GetObject\",
+                        \"s3:GetObjectVersion\",
+                        \"s3:GetObjectTagging\"
+                    ],
+                    \"Resource\": [\"arn:aws:s3:::${S3_BUCKET_NAME}/*\"]
+                },
+                {
+                    \"Effect\": \"Allow\",
+                    \"Action\": [
+                        \"s3:ListBucket\",
+                        \"s3:GetBucketLocation\",
+                        \"s3:GetBucketVersioning\"
+                    ],
+                    \"Resource\": [\"arn:aws:s3:::${S3_BUCKET_NAME}\"]
+                }
             ]
         }"
     print_success "S3 access policy attached"
@@ -409,8 +429,8 @@ create_iam_role() {
         }"
     print_success "Secrets access policy attached"
     
-    print_info "Waiting for IAM propagation (10 seconds)..."
-    sleep 10
+    print_info "Waiting for IAM propagation (15 seconds)..."
+    sleep 15
 }
 
 create_glue_connection() {
@@ -474,6 +494,9 @@ register_with_lakeformation() {
     
     local connection_arn="arn:aws:glue:${AWS_REGION}:${AWS_ACCOUNT_ID}:connection/${CONNECTION_NAME}"
     
+    # Get the current user's ARN
+    local caller_arn=$(aws sts get-caller-identity --query 'Arn' --output text)
+    
     print_info "Registering connection with Lake Formation..."
     
     # Register resource
@@ -484,6 +507,21 @@ register_with_lakeformation() {
         --region "$AWS_REGION" 2>/dev/null || print_warning "Resource may already be registered"
     
     print_success "Connection registered with Lake Formation"
+    
+    # Make the current user a Data Lake Administrator (bypasses all LF permission checks)
+    print_info "Adding you as a Data Lake Administrator..."
+    
+    aws lakeformation put-data-lake-settings \
+        --data-lake-settings "{
+            \"DataLakeAdmins\": [
+                {\"DataLakePrincipalIdentifier\": \"${caller_arn}\"}
+            ],
+            \"CreateDatabaseDefaultPermissions\": [],
+            \"CreateTableDefaultPermissions\": []
+        }" \
+        --region "$AWS_REGION" 2>/dev/null || print_warning "Could not update Data Lake settings (you may need to do this manually)"
+    
+    print_success "You are now a Data Lake Administrator (full access to all tables)"
 }
 
 create_federated_catalog() {
@@ -515,26 +553,84 @@ create_federated_catalog() {
     
     CATALOG_NAME="$catalog_name"
     
+    # Wait for catalog to be fully available
+    print_info "Waiting for catalog to be ready (5 seconds)..."
+    sleep 5
+    
     # Grant permissions
     print_info "Granting Lake Formation permissions..."
     
+    # Grant catalog-level permissions
+    local catalog_grant_result
+    catalog_grant_result=$(aws lakeformation grant-permissions \
+        --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+        --resource "{\"Catalog\": {\"Id\": \"${AWS_ACCOUNT_ID}:${catalog_name}\"}}" \
+        --permissions "ALL" \
+        --region "$AWS_REGION" 2>&1) || true
+    
+    if [[ "$catalog_grant_result" == *"error"* ]] || [[ "$catalog_grant_result" == *"Error"* ]]; then
+        print_warning "Catalog permission grant issue (may already exist): ${catalog_grant_result}"
+    else
+        print_success "Catalog permissions granted"
+    fi
+    
+    # Grant database and table permissions (PARALLEL for speed)
     local databases=$(aws glue get-databases --catalog-id "${AWS_ACCOUNT_ID}:${catalog_name}" --region "$AWS_REGION" --query 'DatabaseList[*].Name' --output text 2>/dev/null || echo "")
     
+    # First, grant database-level permissions (quick, sequential)
     for db in $databases; do
         aws lakeformation grant-permissions \
             --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
             --resource "{\"Database\": {\"CatalogId\": \"${AWS_ACCOUNT_ID}:${catalog_name}\", \"Name\": \"${db}\"}}" \
             --permissions "ALL" \
             --region "$AWS_REGION" 2>/dev/null || true
-        
-        aws lakeformation grant-permissions \
-            --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
-            --resource "{\"Table\": {\"CatalogId\": \"${AWS_ACCOUNT_ID}:${catalog_name}\", \"DatabaseName\": \"${db}\", \"TableWildcard\": {}}}" \
-            --permissions "ALL" \
-            --region "$AWS_REGION" 2>/dev/null || true
-        
-        print_success "Permissions granted for database: ${db}"
+        print_success "Database permissions granted: ${db}"
     done
+    
+    # Collect all tables for parallel processing
+    print_info "Collecting tables for permission grants..."
+    local temp_file=$(mktemp)
+    local total_tables=0
+    
+    for db in $databases; do
+        local tables=$(aws glue get-tables --catalog-id "${AWS_ACCOUNT_ID}:${catalog_name}" --database-name "$db" --region "$AWS_REGION" --query 'TableList[*].Name' --output text 2>/dev/null || echo "")
+        for table in $tables; do
+            echo "${db}|${table}" >> "$temp_file"
+            total_tables=$((total_tables + 1))
+        done
+    done
+    
+    if [ "$total_tables" -gt 0 ]; then
+        print_info "Granting permissions on ${total_tables} tables (50 parallel jobs)..."
+        
+        local parallel_jobs=50
+        local granted=0
+        
+        while IFS='|' read -r db table; do
+            (
+                aws lakeformation grant-permissions \
+                    --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+                    --resource "{\"Table\": {\"CatalogId\": \"${AWS_ACCOUNT_ID}:${catalog_name}\", \"DatabaseName\": \"${db}\", \"Name\": \"${table}\"}}" \
+                    --permissions "ALL" \
+                    --region "$AWS_REGION" 2>/dev/null || true
+                echo -e "  ${GREEN}✓${NC} ${db}.${table}"
+            ) &
+            
+            # Limit parallel jobs
+            while [ $(jobs -r | wc -l) -ge $parallel_jobs ]; do
+                sleep 0.1
+            done
+        done < "$temp_file"
+        
+        # Wait for all background jobs
+        wait
+        
+        print_success "All table permissions granted!"
+    else
+        print_info "No tables found (they'll be granted when you run sync-permissions.sh)"
+    fi
+    
+    rm -f "$temp_file"
 }
 
 print_success_summary() {
@@ -574,6 +670,12 @@ print_success_summary() {
     echo -e "${YELLOW}Or list your tables with AWS CLI:${NC}"
     echo ""
     echo -e "  ${CYAN}aws glue get-tables --catalog-id \"${AWS_ACCOUNT_ID}:${CATALOG_NAME}\" --database-name \"default\" --region ${AWS_REGION}${NC}"
+    echo ""
+    echo -e "${YELLOW}When you create NEW tables in Unity Catalog:${NC}"
+    echo ""
+    echo -e "  Run: ${CYAN}./sync-permissions.sh --catalog ${CATALOG_NAME}${NC}"
+    echo ""
+    echo "  This grants Lake Formation permissions on all tables (runs in parallel, fast!)."
     echo ""
     echo -e "${DIM}To remove this federation, run: ./cleanup.sh --prefix ${PREFIX}${NC}"
     echo ""

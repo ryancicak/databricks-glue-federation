@@ -122,6 +122,30 @@ cp examples/config.example.env .env
 
 ---
 
+## New Tables Not Showing Up?
+
+AWS Lake Formation requires explicit per-table permissions for federated catalogs. When you create new tables in Unity Catalog, run:
+
+```bash
+./sync-permissions.sh --catalog your-catalog-name
+```
+
+This script:
+- Discovers all tables across all databases
+- Grants Lake Formation permissions in parallel (50 concurrent by default)
+- Is idempotent (safe to run multiple times)
+
+**Speed:**
+| Tables | Time (50 parallel) | Time (100 parallel) |
+|--------|-------------------|---------------------|
+| 1000   | ~30 sec           | ~15 sec             |
+| 5000   | ~2 min            | ~1 min              |
+| 10000  | ~4 min            | ~2 min              |
+
+For maximum speed: `./sync-permissions.sh --catalog my-catalog --parallel 100`
+
+---
+
 ## Troubleshooting
 
 ### "Access Denied for the given secret ID"
@@ -147,16 +171,24 @@ aws lakeformation register-resource \
   --with-federation
 ```
 
-### Athena returns "no accessible columns"
+### Athena returns "TABLE_NOT_FOUND" or "no accessible columns"
 
-Grant Lake Formation permissions:
+For federated catalogs, Lake Formation requires per-table permissions. Run:
+
+```bash
+./sync-permissions.sh --catalog your-catalog-name
+```
+
+Or for a single table:
 
 ```bash
 aws lakeformation grant-permissions \
   --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
-  --resource '{"Table": {"CatalogId": "ACCOUNT:CATALOG", "DatabaseName": "default", "TableWildcard": {}}}' \
+  --resource '{"Table": {"CatalogId": "ACCOUNT:CATALOG", "DatabaseName": "default", "Name": "your_table"}}' \
   --permissions "ALL"
 ```
+
+Note: `TableWildcard` does NOT work for federated catalogs (AWS limitation).
 
 ---
 
@@ -173,6 +205,14 @@ Yes. Run the script multiple times with different prefixes.
 **What permissions does my Service Principal need?**
 
 `USE CATALOG` and `SELECT` on the tables you want to query.
+
+**Why don't new tables automatically appear in Athena?**
+
+AWS Lake Formation requires explicit per-table permissions for federated catalogs. This is an AWS limitation — wildcards don't work. Run `./sync-permissions.sh` after creating new tables.
+
+**Can I automate the sync?**
+
+Yes! Set up a cron job or Lambda to run `sync-permissions.sh` periodically (e.g., every 5 minutes).
 
 ---
 

@@ -72,6 +72,13 @@ if [ -z "$PREFIX" ]; then
     exit 1
 fi
 
+# Smart prefix handling: strip common suffixes if user provided full resource name
+# e.g., "myproject-catalog" -> "myproject", "myproject-connection" -> "myproject"
+PREFIX="${PREFIX%-catalog}"
+PREFIX="${PREFIX%-connection}"
+PREFIX="${PREFIX%-glue-role}"
+PREFIX="${PREFIX%-oauth-secret}"
+
 if [ -z "$AWS_REGION" ]; then
     AWS_REGION=$(aws configure get region 2>/dev/null || echo "us-west-2")
 fi
