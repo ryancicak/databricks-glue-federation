@@ -8,7 +8,7 @@ Query your Databricks Unity Catalog tables from Amazon Athena, EMR, Redshift Spe
 
 ## Background
 
-At re:Invent 2025, AWS announced federated catalogs for Glue, allowing it to connect to external catalog sources like Databricks Unity Catalog via the Iceberg REST API.
+At re:Invent 2024, AWS announced federated catalogs for Glue, allowing it to connect to external catalog sources like Databricks Unity Catalog via the Iceberg REST API.
 
 The problem? Getting it working requires:
 

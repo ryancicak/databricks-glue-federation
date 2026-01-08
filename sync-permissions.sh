@@ -92,6 +92,44 @@ echo -e "Region:   ${GREEN}${AWS_REGION}${NC}"
 echo -e "Parallel: ${GREEN}${PARALLEL_JOBS} jobs${NC}"
 echo ""
 
+# Try to find the Glue role from the connection
+echo -e "${YELLOW}Looking up Glue connection role...${NC}"
+CONNECTION_NAME=$(aws glue get-catalog --catalog-id "$CATALOG_ID" --region "$AWS_REGION" --query 'Catalog.FederatedCatalog.ConnectionName' --output text 2>/dev/null || echo "")
+GLUE_ROLE_ARN=""
+if [ -n "$CONNECTION_NAME" ] && [ "$CONNECTION_NAME" != "None" ]; then
+    GLUE_ROLE_ARN=$(aws glue get-connection --name "$CONNECTION_NAME" --region "$AWS_REGION" --query 'Connection.ConnectionProperties.ROLE_ARN' --output text 2>/dev/null || echo "")
+    if [ -n "$GLUE_ROLE_ARN" ] && [ "$GLUE_ROLE_ARN" != "None" ]; then
+        echo -e "Found role: ${GREEN}${GLUE_ROLE_ARN}${NC}"
+    fi
+fi
+echo ""
+
+# Grant catalog-level permissions first
+echo -e "${YELLOW}Granting catalog-level permissions...${NC}"
+aws lakeformation grant-permissions \
+    --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+    --resource "{\"Catalog\": {\"Id\": \"${CATALOG_ID}\"}}" \
+    --permissions "ALL" \
+    --region "$AWS_REGION" 2>/dev/null || true
+
+if [ -n "$GLUE_ROLE_ARN" ] && [ "$GLUE_ROLE_ARN" != "None" ]; then
+    aws lakeformation grant-permissions \
+        --principal "{\"DataLakePrincipalIdentifier\": \"${GLUE_ROLE_ARN}\"}" \
+        --resource "{\"Catalog\": {\"Id\": \"${CATALOG_ID}\"}}" \
+        --permissions "ALL" \
+        --region "$AWS_REGION" 2>/dev/null || true
+fi
+
+# Grant permissions on the default database (often checked by Glue)
+aws lakeformation grant-permissions \
+    --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+    --resource '{"Database": {"Name": "default"}}' \
+    --permissions "DESCRIBE" \
+    --region "$AWS_REGION" 2>/dev/null || true
+
+echo -e "  ${GREEN}✓${NC} Catalog permissions set"
+echo ""
+
 # Get all databases
 echo -e "${YELLOW}Discovering databases...${NC}"
 DATABASES=$(aws glue get-databases --catalog-id "$CATALOG_ID" --region "$AWS_REGION" --query 'DatabaseList[].Name' --output text 2>/dev/null || echo "")
@@ -122,7 +160,28 @@ export -f grant_table_permission
 TOTAL_TABLES=0
 TEMP_FILE=$(mktemp)
 
-# Collect all tables first
+# Grant database-level permissions first
+echo -e "${YELLOW}Granting database-level permissions...${NC}"
+for DB in $DATABASES; do
+    aws lakeformation grant-permissions \
+        --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+        --resource "{\"Database\": {\"CatalogId\": \"${CATALOG_ID}\", \"Name\": \"${DB}\"}}" \
+        --permissions "ALL" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    
+    if [ -n "$GLUE_ROLE_ARN" ] && [ "$GLUE_ROLE_ARN" != "None" ]; then
+        aws lakeformation grant-permissions \
+            --principal "{\"DataLakePrincipalIdentifier\": \"${GLUE_ROLE_ARN}\"}" \
+            --resource "{\"Database\": {\"CatalogId\": \"${CATALOG_ID}\", \"Name\": \"${DB}\"}}" \
+            --permissions "ALL" \
+            --region "$AWS_REGION" 2>/dev/null || true
+    fi
+    
+    echo -e "  ${GREEN}✓${NC} Database: ${DB}"
+done
+echo ""
+
+# Collect all tables
 echo -e "${YELLOW}Collecting tables from all databases...${NC}"
 for DB in $DATABASES; do
     TABLES=$(aws glue get-tables --catalog-id "$CATALOG_ID" --database-name "$DB" --region "$AWS_REGION" --query 'TableList[].Name' --output text 2>/dev/null || echo "")
@@ -143,11 +202,22 @@ GRANTED=0
 while IFS='|' read -r DB TABLE; do
     # Run in background, limit concurrent jobs
     (
+        # Grant to IAM_ALLOWED_PRINCIPALS
         aws lakeformation grant-permissions \
             --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
             --resource "{\"Table\": {\"CatalogId\": \"${CATALOG_ID}\", \"DatabaseName\": \"${DB}\", \"Name\": \"${TABLE}\"}}" \
             --permissions "ALL" \
             --region "$AWS_REGION" 2>/dev/null
+        
+        # Also grant to Glue role if we found it
+        if [ -n "$GLUE_ROLE_ARN" ] && [ "$GLUE_ROLE_ARN" != "None" ]; then
+            aws lakeformation grant-permissions \
+                --principal "{\"DataLakePrincipalIdentifier\": \"${GLUE_ROLE_ARN}\"}" \
+                --resource "{\"Table\": {\"CatalogId\": \"${CATALOG_ID}\", \"DatabaseName\": \"${DB}\", \"Name\": \"${TABLE}\"}}" \
+                --permissions "ALL" \
+                --region "$AWS_REGION" 2>/dev/null
+        fi
+        
         echo -e "  ${GREEN}✓${NC} ${DB}.${TABLE}"
     ) &
     
