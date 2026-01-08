@@ -148,6 +148,37 @@ For maximum speed: `./sync-permissions.sh --catalog my-catalog --parallel 100`
 
 ## Troubleshooting
 
+### "Insufficient Lake Formation permission(s) on ..."
+
+This is the most common error. Check these things:
+
+1. **Are you querying the right catalog?** Use the federated Glue catalog name (e.g., `prefix-catalog`), not the original UC catalog name:
+   ```bash
+   aws glue get-catalogs --query 'CatalogList[].Name'
+   ```
+
+2. **Is your IAM role a Lake Formation admin?** Check in the LF console, or run:
+   ```bash
+   aws lakeformation get-data-lake-settings --query 'DataLakeSettings.DataLakeAdmins'
+   ```
+
+3. **Grant permissions to your specific role:**
+   ```bash
+   ROLE_ARN=$(aws sts get-caller-identity --query 'Arn' --output text)
+   aws lakeformation grant-permissions \
+     --principal "{\"DataLakePrincipalIdentifier\": \"${ROLE_ARN}\"}" \
+     --resource '{"Catalog": {"Id": "ACCOUNT:CATALOG"}}' \
+     --permissions "ALL"
+   ```
+
+4. **Grant permissions on the default database:**
+   ```bash
+   aws lakeformation grant-permissions \
+     --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+     --resource '{"Database": {"Name": "default"}}' \
+     --permissions "DESCRIBE"
+   ```
+
 ### "Access Denied for the given secret ID"
 
 The IAM role needs an explicit policy to access the secret. The script handles this, but if you're doing manual setup:

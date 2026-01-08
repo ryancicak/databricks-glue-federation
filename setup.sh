@@ -522,6 +522,23 @@ register_with_lakeformation() {
         --region "$AWS_REGION" 2>/dev/null || print_warning "Could not update Data Lake settings (you may need to do this manually)"
     
     print_success "You are now a Data Lake Administrator (full access to all tables)"
+    
+    # Grant permissions on the default database (Glue often checks this)
+    print_info "Granting permissions on default database..."
+    aws lakeformation grant-permissions \
+        --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+        --resource "{\"Database\": {\"Name\": \"default\"}}" \
+        --permissions "DESCRIBE" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    
+    # Also grant to the Glue role explicitly
+    aws lakeformation grant-permissions \
+        --principal "{\"DataLakePrincipalIdentifier\": \"${ROLE_ARN}\"}" \
+        --resource "{\"Database\": {\"Name\": \"default\"}}" \
+        --permissions "DESCRIBE" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    
+    print_success "Default database permissions granted"
 }
 
 create_federated_catalog() {
@@ -560,19 +577,21 @@ create_federated_catalog() {
     # Grant permissions
     print_info "Granting Lake Formation permissions..."
     
-    # Grant catalog-level permissions
-    local catalog_grant_result
-    catalog_grant_result=$(aws lakeformation grant-permissions \
+    # Grant catalog-level permissions to IAM_ALLOWED_PRINCIPALS
+    aws lakeformation grant-permissions \
         --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
         --resource "{\"Catalog\": {\"Id\": \"${AWS_ACCOUNT_ID}:${catalog_name}\"}}" \
         --permissions "ALL" \
-        --region "$AWS_REGION" 2>&1) || true
+        --region "$AWS_REGION" 2>/dev/null || true
     
-    if [[ "$catalog_grant_result" == *"error"* ]] || [[ "$catalog_grant_result" == *"Error"* ]]; then
-        print_warning "Catalog permission grant issue (may already exist): ${catalog_grant_result}"
-    else
-        print_success "Catalog permissions granted"
-    fi
+    # Also grant to the Glue role explicitly (fixes permission errors)
+    aws lakeformation grant-permissions \
+        --principal "{\"DataLakePrincipalIdentifier\": \"${ROLE_ARN}\"}" \
+        --resource "{\"Catalog\": {\"Id\": \"${AWS_ACCOUNT_ID}:${catalog_name}\"}}" \
+        --permissions "ALL" \
+        --region "$AWS_REGION" 2>/dev/null || true
+    
+    print_success "Catalog permissions granted"
     
     # Grant database and table permissions (PARALLEL for speed)
     local databases=$(aws glue get-databases --catalog-id "${AWS_ACCOUNT_ID}:${catalog_name}" --region "$AWS_REGION" --query 'DatabaseList[*].Name' --output text 2>/dev/null || echo "")
@@ -581,6 +600,12 @@ create_federated_catalog() {
     for db in $databases; do
         aws lakeformation grant-permissions \
             --principal '{"DataLakePrincipalIdentifier": "IAM_ALLOWED_PRINCIPALS"}' \
+            --resource "{\"Database\": {\"CatalogId\": \"${AWS_ACCOUNT_ID}:${catalog_name}\", \"Name\": \"${db}\"}}" \
+            --permissions "ALL" \
+            --region "$AWS_REGION" 2>/dev/null || true
+        # Also grant to Glue role
+        aws lakeformation grant-permissions \
+            --principal "{\"DataLakePrincipalIdentifier\": \"${ROLE_ARN}\"}" \
             --resource "{\"Database\": {\"CatalogId\": \"${AWS_ACCOUNT_ID}:${catalog_name}\", \"Name\": \"${db}\"}}" \
             --permissions "ALL" \
             --region "$AWS_REGION" 2>/dev/null || true
